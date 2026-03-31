@@ -1,0 +1,377 @@
+from transformers import (
+    EsmModel,
+    EsmPreTrainedModel,
+    BertModel,
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from peft import LoraConfig, get_peft_model
+import ipdb
+
+class ModifiedEsmForSequenceClassification_Biomap(EsmPreTrainedModel):
+    def __init__(self, config, config2, word_embedding, word_embedding2, num_labels, ab_step, ag_step):
+        super().__init__(config)
+        self.num_labels = num_labels
+        self.ab_step = ab_step
+        self.ag_step = ag_step
+        
+        self.bert = EsmModel(config)
+        
+        self.antigen = BertModel(config2)
+
+        self.feature_extracion = representation_feature_extraction(feature_dim=768, total_step=ab_step)
+
+        self.ag_feature_extraction = ag_representation_feature_extraction(feature_dim=1024, total_step=ag_step)
+
+        self.ab_cls = Atten_classficationHead(word_embedding)
+
+        self.ag_cls = Atten_classficationHead2(word_embedding2)
+
+        self.Ag_ab = AntigenAntibodyModel(feature_dim=1024, num_heads=4)
+
+    def forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            infill_mask= None,
+            antigen_input_ids=None,
+            antigen_attention_mask=None,
+    ):
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=return_dict,
+        )
+
+        antigen_rep = self.antigen(
+            input_ids = antigen_input_ids,
+            attention_mask=antigen_attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs.hidden_states
+        representations = torch.stack(hidden_states, dim=2) # [batch, 510, 17, 768]
+
+        new_rep = (torch.zeros(17).softmax(0).unsqueeze(0).cuda() @ representations.cuda()).squeeze(2) # [batch, 510, 768]
+        rep0 = hidden_states[-1]
+
+        ag_hidden = antigen_rep[2]
+        ag_representations = torch.stack(ag_hidden, dim=2)
+        ag_rep = (torch.zeros(31).softmax(0).unsqueeze(0).cuda() @ ag_representations.cuda()).squeeze(2) # [batch, 512, 1024]
+
+        ag_rep0 = antigen_rep[0]
+
+        all_reps, extraction_output = self.feature_extracion(rep0, new_rep)
+        all_reps, antigen_extraction = self.ag_feature_extraction(ag_rep0, ag_rep)
+
+
+        antibody_input = extraction_output
+        antigen_input = antigen_extraction
+
+        antibody_output = self.ab_cls(antibody_input,  input_ids)
+        antigen_output = self.ag_cls(antigen_input, antigen_input_ids)
+
+        logits = self.Ag_ab(antigen_output, antibody_output)
+
+    
+        loss = None
+        if self.num_labels == 1:  #reg
+            loss_fct = nn.MSELoss()
+            loss = loss_fct(logits.squeeze(), labels.squeeze())  
+
+        if self.num_labels == 2:  #HER2
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if self.num_labels == 10:  #covid
+            loss_fct = nn.BCEWithLogitsLoss()
+            loss = loss_fct(logits, labels)
+
+
+        return SequenceClassifierOutput(
+            loss = loss,
+            logits = logits,
+            hidden_states= None,
+            attentions= None
+        )
+
+class representation_feature_extraction(nn.Module):
+    def __init__(self,feature_dim =768, total_step=10):
+        super().__init__()
+
+        self.feature_dim = feature_dim
+        self.total_step = total_step
+        
+        if total_step > 0:
+            self.step_embedding = nn.Embedding(total_step, feature_dim)
+        else:
+            self.register_parameter('step_embedding', None)
+
+        self.rep0_mlp = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.LayerNorm(feature_dim)
+        )
+
+        self.conv = nn.Conv1d(feature_dim, feature_dim, kernel_size=7, stride=1, padding=3)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2*feature_dim, feature_dim),
+            nn.GELU(),
+            nn.LayerNorm(feature_dim)
+        )
+
+        self.correction_mlp = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, feature_dim)
+        )
+
+    def forward(self, rep0, new_rep):
+
+        batch_size, seq_len, _ = rep0.shape
+        device = rep0.device
+
+        all_representations = []
+        current_rep = rep0
+
+        all_representations.append(current_rep)
+        
+        if self.total_step > 0:
+
+            step_indices = torch.arange(self.total_step, dtype=torch.long, device=device)
+            step_embed = self.step_embedding(step_indices) # [5,768]
+
+            for step in range(self.total_step):
+                rep_processed = self.rep0_mlp(current_rep.detach())
+                step_embed_expanded = step_embed[step].view(1,1,-1).expand(batch_size, seq_len, -1)
+                rep_processed = rep_processed + step_embed_expanded
+
+                rep_cov = self.conv(rep_processed.transpose(1,2))
+                rep_processed = rep_cov.transpose(1,2)
+
+                fused_rep = torch.cat([rep_processed, new_rep], dim=-1)
+                fused_rep = self.fusion_mlp(fused_rep)
+
+                correction = self.correction_mlp(fused_rep)
+                current_rep = current_rep - correction
+
+                all_representations.append(current_rep)
+
+        return all_representations, all_representations[-1]
+
+class ag_representation_feature_extraction(nn.Module):
+    def __init__(self, feature_dim=1024, total_step=10):
+        super().__init__()
+
+        self.feature_dim = feature_dim
+        self.total_step = total_step
+        
+
+        if total_step > 0:
+            self.step_embedding = nn.Embedding(total_step, feature_dim)
+        else:
+            self.register_parameter('step_embedding', None)
+
+        self.rep0_mlp = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.LayerNorm(feature_dim)
+        )
+
+        self.conv = nn.Conv1d(feature_dim, feature_dim, kernel_size=7, stride=1, padding=3)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2*feature_dim, feature_dim),
+            nn.GELU(),
+            nn.LayerNorm(feature_dim)
+        )
+
+        self.correction_mlp = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, feature_dim)
+        )
+
+    def forward(self, rep0, new_rep):
+        batch_size, seq_len, _ = rep0.shape
+        device = rep0.device
+
+        all_representations = []
+        current_rep = rep0
+        all_representations.append(current_rep)
+        
+        if self.total_step > 0:
+            step_indices = torch.arange(self.total_step, dtype=torch.long, device=device)
+            step_embed = self.step_embedding(step_indices) # [total_step, feature_dim]
+            
+            for step in range(self.total_step):
+                rep_processed = self.rep0_mlp(current_rep.detach())
+                step_embed_expanded = step_embed[step].view(1,1,-1).expand(batch_size, seq_len, -1)
+                rep_processed = rep_processed + step_embed_expanded
+
+                rep_cov = self.conv(rep_processed.transpose(1,2))
+                rep_processed = rep_cov.transpose(1,2)
+
+                fused_rep = torch.cat([rep_processed, new_rep], dim=-1)
+                fused_rep = self.fusion_mlp(fused_rep)
+
+                correction = self.correction_mlp(fused_rep)
+                current_rep = current_rep - correction
+
+                all_representations.append(current_rep)
+
+        return all_representations, all_representations[-1]
+
+class Atten_classficationHead(nn.Module):
+    def __init__(self, word_embedding):
+        super().__init__()
+
+        self.Linear = nn.Linear(768,512)
+        self.word_linear = nn.Sequential(
+            nn.Linear(768,512),
+            nn.ReLU(),
+            nn.Dropout(0.1))
+
+        self.attention1 = nn.Sequential(
+            nn.Linear(512,256),
+            nn.Tanh(),
+            nn.Dropout(0.1)
+        )
+
+        self.attention2 = nn.Sequential(
+            nn.Linear(512,256),
+            nn.Sigmoid(),
+            nn.Dropout(0.1)
+        )
+
+        self.Linear2 = nn.Linear(256,1)
+
+        self.word_embedding = word_embedding
+
+
+    def forward(self, input,  input_ids):   # input [batch, 152, 768]
+
+        input1 = self.Linear(input)  # input1 [batch, 152, 512]
+        a = self.attention1(input1)  # a [batch, 152, 256]
+        b = self.attention2(input1)  # b [batch, 152, 256]
+        attention = a.mul(b)
+        attention = self.Linear2(attention)
+
+        attention = F.softmax(attention, dim=1) 
+        attention = attention.permute(0,2,1) # [batch, 1, 152]
+
+        aa_embeds = self.word_embedding(input_ids)
+        aa_embeds = self.word_linear(aa_embeds)
+        aa_embeds = torch.bmm(attention, aa_embeds)
+    
+        antibody_feature = torch.bmm(attention, input1) # [batch, 1, 512]
+
+        antibody_input = torch.cat([antibody_feature.squeeze(1), aa_embeds.squeeze(1)], dim=1)  # [batch, 1024]
+
+
+        return antibody_input
+
+class Atten_classficationHead2(nn.Module):
+    def __init__(self, word_embedding):
+        super().__init__()
+
+        self.Linear = nn.Linear(1024,512)
+        self.word_linear = nn.Sequential(
+            nn.Linear(1024,512),
+            nn.ReLU(),
+            nn.Dropout(0.1))
+
+        self.attention1 = nn.Sequential(
+            nn.Linear(512,256),
+            nn.Tanh(),
+            nn.Dropout(0.1)
+        )
+
+        self.attention2 = nn.Sequential(
+            nn.Linear(512,256),
+            nn.Sigmoid(),
+            nn.Dropout(0.1)
+        )
+
+        self.Linear2 = nn.Linear(256,1)
+
+        self.word_embedding = word_embedding
+
+
+    def forward(self, input, input_ids):   # input [batch, 512, 1024];  input_ids [batch, 512]
+
+        input1 = self.Linear(input)  # input1 [batch, 512, 512]
+        a = self.attention1(input1)  # a [batch, 512, 256]
+        b = self.attention2(input1)  # b [batch, 512, 256]
+        attention = a.mul(b)
+        attention = self.Linear2(attention)
+
+        attention = F.softmax(attention, dim=1) 
+        attention = attention.permute(0,2,1) # [batch, 1, 512]
+
+        aa_embeds = self.word_embedding(input_ids) # [batch, 512, 1024]
+        aa_embeds = self.word_linear(aa_embeds)
+        aa_embeds = torch.bmm(attention, aa_embeds)
+    
+        antigen_feature = torch.bmm(attention, input1) # [batch, 1, 512]
+
+        antigen_input = torch.cat([antigen_feature.squeeze(1), aa_embeds.squeeze(1)], dim=1)  # [batch, 1024]
+
+        return antigen_input
+
+class CrossAttention(nn.Module):
+    def __init__(self, num_heads):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(1024, num_heads)
+        
+    def forward(self, antigen, antibody):
+        antigen = antigen.unsqueeze(0)  # [1, batch, features]
+        antibody = antibody.unsqueeze(0)
+        attended, _ = self.attention(antigen, antibody, antibody)
+        return attended.squeeze(0)
+    
+class AntigenAntibodyModel(nn.Module):
+    def __init__(self, feature_dim, num_heads):
+        super().__init__()
+        self.attention = CrossAttention(num_heads)
+        self.fc = nn.Sequential(
+            nn.Linear(feature_dim * 4, feature_dim),  
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            nn.Linear(feature_dim, 1)  
+        )
+
+    def forward(self, antigen, antibody):
+        attended = self.attention(antigen, antibody)  # [batch, 1024]
+        interacted = antigen * antibody # [batch, 1024]
+        combined = torch.cat([antigen, antibody, attended, interacted], dim=-1) # [batch, 1024*4]
+        return self.fc(combined)
