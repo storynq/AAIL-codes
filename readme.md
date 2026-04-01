@@ -24,7 +24,7 @@ We recommend using `conda` to manage the environment.
     ```
 
 2.  **Download pretrained models, datasets, and environment:**
-    We provide the pretrained antibody language model checkpoint, pretrained datasets, and packed environment used in our study at this link:
+    We provide the pretrained antibody language model checkpoint, pretrained datasets, and packed environment used in our study at this link: 10.5281/zenodo.19364855
 
 
 3.  **Create and activate the environment from the :**
@@ -63,7 +63,7 @@ python code/AAIL_biomap.py
 
 ## Pre-training
 
-The script for pre-training the antibody language model on the OAS database is also provided. The pretraining dataset needs to be downloaded:
+The script for pre-training the antibody language model on the OAS database is also provided. The pretraining dataset needs to be downloaded: 10.5281/zenodo.19364855
 
 ```bash
 python code/AAIL_Pretrain.py
