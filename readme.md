@@ -4,7 +4,7 @@ This repository contains the official implementation and data for the paper: **"
 
 AAIL is a dual-encoder deep learning framework designed to predict the outcomes of antibody-antigen interactions directly from their sequences. It incorporates a novel fine-tuning architecture to achieve state-of-the-art performance on multiple benchmark tasks.
 
-![AAIL Architecture](figure/AAIL_architecture.png) 
+![AAIL Architecture](figure/framework_new.png) 
 
 ## Key Features
 
